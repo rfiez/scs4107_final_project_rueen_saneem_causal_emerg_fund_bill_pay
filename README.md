@@ -11,6 +11,7 @@ This repository contains the deliverable Jupyter notebook for the University of 
 | `module_labels_validation.txt` | Validation notes for module and cell labels |
 | `notebook_summary.json` | Machine-readable summary metadata of the notebook structure |
 | `reorder_validation.txt` | Validation log from notebook cell reordering |
+| `data/raw/shed_2023.csv` | SHED 2023 public use data file used by the notebook |
 
 ## How to view or run the notebook
 
@@ -27,7 +28,7 @@ Alternatively:
 3. Select `causal_ai_emergency_fund_notebook.ipynb`
 4. Run cells by clicking the ▶ button next to each cell
 
-> **Note:** If the notebook references data files from the broader project (for example, files under `../data/`), Colab will not have them automatically. In that case, upload the required files using the Files panel on the left, or clone the full project repository inside Colab.
+> **Note:** The notebook downloads the SHED 2023 CSV automatically from this repository's `data/raw/shed_2023.csv` file, so no manual upload is required in Colab.
 
 ### Option 2 — Run locally in VS Code
 

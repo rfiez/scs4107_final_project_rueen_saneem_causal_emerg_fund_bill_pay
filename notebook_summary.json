@@ -1,0 +1,54 @@
+{
+  "project": "Emergency Fund and Household Bill Payment Causal AI Capstone",
+  "data_status": "empirical",
+  "survey_wave": "SHED 2023",
+  "design": "Cross-sectional",
+  "raw_n": 11400,
+  "analytic_n": 11400,
+  "treated_n": 6482,
+  "control_n": 4918,
+  "exclusions": {
+    "empty_or_null_identifier": 0,
+    "age_below_18_or_missing": 0,
+    "nonpositive_or_missing_weight": 0,
+    "missing_treatment": 0,
+    "missing_outcome": 0,
+    "missing_confounder": 0
+  },
+  "propensity_support": {
+    "n_total": 11400,
+    "n_support": 11400,
+    "support_bound": 0.01
+  },
+  "balance": {
+    "max_smd_before": 0.7534855674763881,
+    "max_smd_after": 0.032447032955173746,
+    "all_balanced": "True"
+  },
+  "estimates": {
+    "unadjusted": {
+      "estimate": 0.21042448829737026,
+      "ci_lower": 0.19717725826855642,
+      "ci_upper": 0.2236717183261841
+    },
+    "ipw": {
+      "estimate": 0.12845268816180144,
+      "mu1": 0.9292650781590647,
+      "mu0": 0.8008123899972632
+    },
+    "aipw": {
+      "estimate": 0.1317063163938781,
+      "mu1": 0.9302100252348567,
+      "mu0": 0.7985037088409787,
+      "ci_lower": 0.11732084961312854,
+      "ci_upper": 0.14609178317462762,
+      "se": 0.0073395238677293586
+    }
+  },
+  "sensitivity": {
+    "e_value_point": 1.6032872183440752,
+    "e_value_lower_ci": 1.5043378839711923,
+    "ipw_uncapped_ate_pp": 12.845268816180145,
+    "ipw_capped_ate_pp": 13.43624345436244
+  }
+}

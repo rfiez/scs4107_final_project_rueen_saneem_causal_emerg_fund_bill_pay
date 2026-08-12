@@ -1,0 +1,1055 @@
+# ---------------------------------------------------------------------------
+# IMPORT REQUIRED LIBRARIES
+# ---------------------------------------------------------------------------
+# We deliberately use a small, standard set of packages so the notebook is
+# portable and easy to run in a fresh environment (e.g., a classroom or
+# grading machine). pandas/numpy handle data, scikit-learn fits the models,
+# statsmodels is available for optional diagnostics, and matplotlib/seaborn
+# produce all figures. networkx draws the DAG.
+# ---------------------------------------------------------------------------
+import warnings
+import json
+import math
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Causal / statistical helpers
+from scipy import stats
+from scipy.special import expit, logit
+from sklearn.linear_model import LogisticRegression
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+import networkx as nx
+
+# display() is provided by IPython inside Jupyter; define a fallback so the
+# same code also runs if the notebook is exported to a plain Python script.
+try:
+    from IPython.display import display
+except ImportError:
+    display = print
+
+# Make plots crisp and reproducible. 300 DPI ensures classroom-projector and
+# print quality if the user saves any figure.
+plt.rcParams["figure.dpi"] = 100
+plt.rcParams["savefig.dpi"] = 300
+sns.set_style("whitegrid")
+
+# Fixed random seed: every model fit and resample will produce identical
+# output when the notebook is rerun from top to bottom.
+SEED = 42
+np.random.seed(SEED)
+
+# Suppress non-critical warnings (e.g., optimizer convergence messages) so the
+# output stays focused on results and interpretation.
+warnings.filterwarnings("ignore")
+
+print("Libraries loaded successfully. Random seed:", SEED)
+
+# ---------------------------------------------------------------------------
+# DEFINE FILE PATHS
+# ---------------------------------------------------------------------------
+# The notebook must be robust to how a user packages the submission.  We
+# therefore check several plausible locations for the SHED 2023 CSV:
+#   1. Project-relative: data/raw/shed_2023.csv
+#   2. Same-folder-as-notebook: shed_2023.csv
+# The codebook PDF is only referenced in markdown text; it is not parsed
+# at runtime, so the notebook does not depend on PDF libraries.
+# ---------------------------------------------------------------------------
+NOTEBOOK_DIR = Path.cwd()  # Directory from which the notebook is running
+
+CANDIDATE_PATHS = [
+    NOTEBOOK_DIR / "data" / "raw" / "shed_2023.csv",
+    NOTEBOOK_DIR.parent / "data" / "raw" / "shed_2023.csv",
+    NOTEBOOK_DIR / "shed_2023.csv",
+    NOTEBOOK_DIR.parent / "shed_2023.csv",
+]
+
+DATA_PATH = None
+for p in CANDIDATE_PATHS:
+    if p.exists():
+        DATA_PATH = p
+        break
+
+if DATA_PATH is None:
+    raise FileNotFoundError(
+        "Could not find shed_2023.csv. Please place it in one of these locations:\n"
+        + "\n".join(str(p) for p in CANDIDATE_PATHS)
+    )
+
+print(f"Using data file: {DATA_PATH}")
+print(f"Notebook directory: {NOTEBOOK_DIR}")
+
+# ---------------------------------------------------------------------------
+# BUILD AND VISUALIZE THE CAUSAL DAG
+# ---------------------------------------------------------------------------
+# The DAG is the core causal assumption of the project.  Every node and arrow
+# encodes a claim about what causes what.  The 12-node model includes:
+#   - Treatment (EmergencyFund) and Outcome (BillsPaidInFull)
+#   - 7 measured pre-treatment confounders we will adjust for
+#   - 1 post-treatment mediator we must NOT adjust for
+#   - 1 selection/collider node we must NOT adjust for
+#   - 1 unmeasured confounder (FinancialShock) that we assess via sensitivity
+# ---------------------------------------------------------------------------
+
+G = nx.DiGraph()
+
+# Nodes with roles for coloring
+nodes = {
+    "EmergencyFund": "treatment",
+    "BillsPaidInFull": "outcome",
+    "Income": "confounder",
+    "Education": "confounder",
+    "Employment": "confounder",
+    "Age": "confounder",
+    "MaritalStatus": "confounder",
+    "Housing": "confounder",
+    "RaceEthnicity": "confounder",
+    "PostTreatmentFinancialStress": "mediator",
+    "AnalyticInclusion": "collider",
+    "FinancialShock": "unmeasured",
+}
+
+# Edges represent assumed causal relationships.
+# Confounders each cause both treatment and outcome.
+# Treatment may also act partly through a post-treatment mediator.
+# FinancialShock is an unmeasured common cause.
+# AnalyticInclusion is a collider created by selection into the sample.
+edges = [
+    ("Income", "EmergencyFund"), ("Income", "BillsPaidInFull"),
+    ("Education", "EmergencyFund"), ("Education", "BillsPaidInFull"),
+    ("Employment", "EmergencyFund"), ("Employment", "BillsPaidInFull"),
+    ("Age", "EmergencyFund"), ("Age", "BillsPaidInFull"),
+    ("MaritalStatus", "EmergencyFund"), ("MaritalStatus", "BillsPaidInFull"),
+    ("Housing", "EmergencyFund"), ("Housing", "BillsPaidInFull"),
+    ("RaceEthnicity", "EmergencyFund"), ("RaceEthnicity", "BillsPaidInFull"),
+    ("EmergencyFund", "BillsPaidInFull"),
+    ("EmergencyFund", "PostTreatmentFinancialStress"),
+    ("PostTreatmentFinancialStress", "BillsPaidInFull"),
+    ("FinancialShock", "EmergencyFund"), ("FinancialShock", "BillsPaidInFull"),
+    ("EmergencyFund", "AnalyticInclusion"), ("BillsPaidInFull", "AnalyticInclusion"),
+]
+
+G.add_nodes_from(nodes.keys())
+G.add_edges_from(edges)
+
+# Manually place nodes so the plot is readable and the causal story is clear.
+pos = {
+    "EmergencyFund": (0, 0),
+    "BillsPaidInFull": (4, 0),
+    "Income": (-2, 2),
+    "Education": (-1, 2.5),
+    "Employment": (0, 2.8),
+    "Age": (1, 2.5),
+    "MaritalStatus": (2, 2),
+    "Housing": (3, 2.5),
+    "RaceEthnicity": (4, 2.8),
+    "PostTreatmentFinancialStress": (2, -1.2),
+    "AnalyticInclusion": (2, -2.4),
+    "FinancialShock": (5, 1),
+}
+
+# Color nodes by their causal role so the legend tells the adjustment story.
+color_map = {
+    "treatment": "#e74c3c",
+    "outcome": "#2ecc71",
+    "confounder": "#3498db",
+    "mediator": "#f39c12",
+    "collider": "#9b59b6",
+    "unmeasured": "#95a5a6",
+}
+node_colors = [color_map[nodes[n]] for n in G.nodes()]
+
+fig, ax = plt.subplots(figsize=(14, 8))
+nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=2500, ax=ax, alpha=0.9)
+nx.draw_networkx_labels(G, pos, font_size=9, ax=ax, font_weight="bold")
+nx.draw_networkx_edges(G, pos, arrows=True, arrowsize=20, ax=ax,
+                       edge_color="#2c3e50", width=1.5, alpha=0.7,
+                       connectionstyle="arc3,rad=0.05")
+
+from matplotlib.patches import Patch
+legend_elements = [
+    Patch(facecolor=color_map["treatment"], label="Treatment (T)"),
+    Patch(facecolor=color_map["outcome"], label="Outcome (Y)"),
+    Patch(facecolor=color_map["confounder"], label="Measured confounder (adjust)"),
+    Patch(facecolor=color_map["mediator"], label="Post-treatment mediator (do NOT adjust)"),
+    Patch(facecolor=color_map["collider"], label="Collider / selection (do NOT adjust)"),
+    Patch(facecolor=color_map["unmeasured"], label="Unmeasured confounder"),
+]
+ax.legend(handles=legend_elements, loc="upper center", bbox_to_anchor=(0.5, -0.05),
+          ncol=3, frameon=False, fontsize=9)
+ax.set_title("Causal DAG: Emergency Funds → Bills Paid in Full\n(12-node structural model)", fontsize=14)
+ax.axis("off")
+plt.tight_layout()
+plt.show()
+
+print("DAG nodes:", list(G.nodes()))
+print("DAG edges:", list(G.edges()))
+
+# ---------------------------------------------------------------------------
+# LOAD AND INSPECT THE SHED 2023 DATA
+# ---------------------------------------------------------------------------
+# We load the raw CSV without any modifications.  low_memory=False prevents
+# pandas from guessing column types in chunks.  We immediately verify that the
+# key columns exist: identifier, treatment (EF1), outcome (EF5C), the seven
+# adjustment covariates, and the survey weight.
+# ---------------------------------------------------------------------------
+raw_df = pd.read_csv(DATA_PATH, low_memory=False)
+
+print(f"Raw dataset shape: {raw_df.shape[0]:,} rows × {raw_df.shape[1]} columns")
+
+required_cols = ['shedid', 'EF1', 'EF5C', 'weight'] + \
+                ['ppinc7', 'ppeduc5', 'ppemploy', 'ppage', 'ppmarit5', 'pphouse4', 'race_5cat']
+all_present = all(col in raw_df.columns for col in required_cols)
+print(f"\nKey columns present: {all_present}")
+
+key_cols = ["shedid", "EF1", "EF5C", "BK1", "ppinc7", "ppeduc5", "ppemploy",
+            "ppage", "ppmarit5", "pphouse4", "race_5cat", "weight"]
+print("\nFirst 5 rows of key variables:")
+display(raw_df[key_cols].head())
+
+# ---------------------------------------------------------------------------
+# INSPECT TREATMENT, OUTCOME, AND COVARIATE DISTRIBUTIONS
+# ---------------------------------------------------------------------------
+# Before modeling, we look at the raw distributions.  This is not a causal
+# analysis yet; it is data understanding.  We use value_counts(dropna=False)
+# so any missing or ambiguous codes are visible immediately.
+# ---------------------------------------------------------------------------
+print("=== TREATMENT (EF1): Has 3-month emergency fund ===")
+print(raw_df["EF1"].value_counts(dropna=False))
+
+print("\n=== OUTCOME (EF5C): Paid all non-credit-card bills in full ===")
+print(raw_df["EF5C"].value_counts(dropna=False))
+
+print("\n=== COVARIATE DISTRIBUTIONS ===")
+for col in ["ppinc7", "ppeduc5", "ppemploy", "ppmarit5", "pphouse4", "race_5cat"]:
+    print(f"\n{col}:")
+    print(raw_df[col].value_counts(dropna=False).head(10))
+
+# ---------------------------------------------------------------------------
+# BUILD THE ANALYTIC SAMPLE
+# ---------------------------------------------------------------------------
+# We apply documented eligibility rules in a fail-transparent way.  Each rule
+# records how many respondents it excludes, so the sample construction is
+# auditable.  The rules follow the project specification:
+#   1. Non-missing identifier
+#   2. Age >= 18, with values above 95 top-coded to 95 (SHED codebook rule)
+#   3. Strictly positive survey weight
+#   4. Valid Yes/No treatment and outcome responses
+#   5. Complete-case on all seven adjustment covariates
+# ---------------------------------------------------------------------------
+
+# Make a working copy so the raw DataFrame stays untouched.
+df = raw_df.copy()
+
+# Record starting counts
+raw_n = len(df)
+exclusions = {}
+
+# 1. Valid identifier
+df = df[df["shedid"].notna()]
+exclusions["empty_or_null_identifier"] = raw_n - len(df)
+
+# 2. Age eligibility: >= 18, top-code >95 to 95 per SHED codebook.
+#    SHED reports ages above 95 as a single 95+ category; we mirror that here.
+df["ppage"] = df["ppage"].clip(upper=95)
+df = df[df["ppage"] >= 18]
+exclusions["age_below_18_or_missing"] = raw_n - len(df) - exclusions["empty_or_null_identifier"]
+
+# 3. Positive survey weight.  Zero or negative weights would break survey
+#    representativeness and could create invalid IPW weights later.
+df = df[df["weight"] > 0]
+exclusions["nonpositive_or_missing_weight"] = (
+    raw_n - len(df) - exclusions["empty_or_null_identifier"] - exclusions["age_below_18_or_missing"]
+)
+
+# 4. Valid treatment and outcome (Yes/No only).  Any skip-pattern or missing
+#    value is excluded under the complete-case rule.
+df = df[df["EF1"].isin(["Yes", "No"])]
+exclusions["missing_treatment"] = (
+    raw_n - len(df) - sum(v for k, v in exclusions.items() if k != "missing_treatment")
+)
+
+base_for_outcome = len(df)
+df = df[df["EF5C"].isin(["Yes", "No"])]
+exclusions["missing_outcome"] = base_for_outcome - len(df)
+
+# 5. Complete-case for all adjustment covariates
+covariates = ["ppinc7", "ppeduc5", "ppemploy", "ppmarit5", "pphouse4", "race_5cat"]
+base_for_confounders = len(df)
+df = df.dropna(subset=covariates)
+exclusions["missing_confounder"] = base_for_confounders - len(df)
+
+# Recode treatment and outcome to binary numeric (1 = Yes, 0 = No).
+df = df.copy()
+df["T"] = (df["EF1"] == "Yes").astype(int)
+df["Y"] = (df["EF5C"] == "Yes").astype(int)
+
+# Final analytic sample
+analytic_n = len(df)
+treated_n = df["T"].sum()
+control_n = analytic_n - treated_n
+
+print(f"Raw records:              {raw_n:,}")
+print(f"Analytic sample:          {analytic_n:,}")
+print(f"Treated (T=1):            {treated_n:,}")
+print(f"Control (T=0):            {control_n:,}")
+print(f"\nExclusion reasons:")
+for reason, count in exclusions.items():
+    print(f"  {reason}: {count:,}")
+
+# Store sample metadata for later
+sample_meta = {
+    "raw_n": raw_n,
+    "analytic_n": analytic_n,
+    "treated_n": int(treated_n),
+    "control_n": int(control_n),
+    "exclusions": exclusions,
+}
+
+# ---------------------------------------------------------------------------
+# RECODE VARIABLES FOR ANALYSIS
+# ---------------------------------------------------------------------------
+# Categorical SHED variables are mapped to numeric codes using the official
+# codebook.  The mapping is explicit so it can be checked by an assessor.
+# We also normalize Unicode apostrophes (e.g., 'Master’s') to plain ASCII
+# apostrophes so string matching is robust.
+# ---------------------------------------------------------------------------
+
+# Income (ppinc7) -> PPINCIMP
+income_map = {
+    "less than $10,000": 1,
+    "$10,000 to $24,999": 2,
+    "$25,000 to $49,999": 3,
+    "$50,000 to $74,999": 4,
+    "$75,000 to $99,999": 5,
+    "$100,000 to $149,999": 6,
+    "$150,000 or more": 7,
+}
+
+# Education (ppeduc5) -> PPEDUC
+educ_map = {
+    "no high school diploma or ged": 1,
+    "high school graduate (high school diploma or the equivalent ged)": 2,
+    "some college or associate's degree": 3,
+    "bachelor's degree": 4,
+    "master's degree or higher": 5,
+}
+
+# Employment (ppemploy) -> PPEMP
+emp_map = {
+    "working full-time": 1,
+    "working part-time": 2,
+    "not working": 3,
+}
+
+# Marital status (ppmarit5) -> PPMARIT
+marit_map = {
+    "now married": 1,
+    "widowed": 2,
+    "divorced": 3,
+    "separated": 4,
+    "never married": 5,
+}
+
+# Housing (pphouse4) -> PPHOUSE
+house_map = {
+    "a one-family house detached from any other house": 1,
+    "a one-family house attached to one or more houses": 2,
+    "building with 2 or more apartments": 3,
+    "mobile home": 4,
+    "one-family condo or townhouse attached to other units": 5,
+    "other (mobile home, boat, rv, van, etc.)": 6,
+}
+
+# Race/ethnicity (race_5cat) -> PPNET
+race_map = {
+    "white": 1,
+    "black": 2,
+    "hispanic": 3,
+    "asian": 4,
+    "other": 5,
+}
+
+# Apply mappings (case-insensitive and quote-normalized to be robust)
+def map_series(s, mapping):
+    # Normalize common Unicode apostrophe-like characters to straight ASCII
+    # apostrophes.  SHED uses the curly apostrophe in "Master's degree".
+    normalized = (
+        s.astype(str)
+        .str.strip()
+        .str.lower()
+        .str.replace(r"[\u2018\u2019\u201a\u201b\u2032\u2035]", "'", regex=True)
+    )
+    lowered_map = {k.lower(): v for k, v in mapping.items()}
+    return normalized.map(lowered_map)
+
+df["PPINCIMP"] = map_series(df["ppinc7"], income_map)
+df["PPEDUC"] = map_series(df["ppeduc5"], educ_map)
+df["PPEMP"] = map_series(df["ppemploy"], emp_map)
+df["PPAGE"] = df["ppage"].astype(int)
+df["PPMARIT"] = map_series(df["ppmarit5"], marit_map)
+df["PPHOUSE"] = map_series(df["pphouse4"], house_map)
+df["PPNET"] = map_series(df["race_5cat"], race_map)
+
+# Verify no unmapped values slipped through.  Unmapped values would silently
+# become NaN and then be dropped, potentially hiding a coding problem.
+for col in ["PPINCIMP", "PPEDUC", "PPEMP", "PPMARIT", "PPHOUSE", "PPNET"]:
+    unmapped = df[col].isna().sum()
+    if unmapped > 0:
+        print(f"Warning: {unmapped} unmapped values in {col}")
+        print(df[col].value_counts(dropna=False))
+    else:
+        print(f"{col}: all values mapped successfully")
+
+# Keep a clean analysis frame with the binary treatment/outcome and the
+# seven canonical adjustment variables.
+analysis_cols = ["shedid", "T", "Y", "weight"] + \
+                ["PPINCIMP", "PPEDUC", "PPEMP", "PPAGE", "PPMARIT", "PPHOUSE", "PPNET"]
+df = df[analysis_cols].dropna()
+print(f"\nFinal analysis-ready sample: {len(df):,} rows")
+
+# ---------------------------------------------------------------------------
+# UNADJUSTED (OBSERVED) EVIDENCE
+# ---------------------------------------------------------------------------
+# This is the raw difference in bill-payment rates between people who do and
+# do not have emergency funds.  It is NOT a causal estimate because we have
+# not yet adjusted for confounders.  We report it first so readers can see
+# how much of the raw gap is explained by measured covariates later.
+# ---------------------------------------------------------------------------
+
+rate_treated = df.loc[df["T"] == 1, "Y"].mean()
+rate_control = df.loc[df["T"] == 0, "Y"].mean()
+unadjusted_diff = rate_treated - rate_control
+
+# Simple 95% CI for the difference of two independent proportions.
+n1, n0 = df["T"].sum(), (df["T"] == 0).sum()
+p1, p0 = rate_treated, rate_control
+se_diff = math.sqrt(p1 * (1 - p1) / n1 + p0 * (1 - p0) / n0)
+ci_lower = unadjusted_diff - 1.96 * se_diff
+ci_upper = unadjusted_diff + 1.96 * se_diff
+
+print("=== OBSERVED (UNADJUSTED) EVIDENCE ===")
+print(f"Bill-payment rate, treated (T=1):   {rate_treated*100:.2f}%")
+print(f"Bill-payment rate, control (T=0):   {rate_control*100:.2f}%")
+print(f"Observed difference:                {unadjusted_diff*100:.2f} percentage points")
+print(f"95% confidence interval:            [{ci_lower*100:.2f}%, {ci_upper*100:.2f}%]")
+print("\nThis is an association, not a causal effect. Confounders are not yet adjusted for.")
+
+# Store for later comparison with adjusted estimates
+unadjusted = {
+    "estimate": unadjusted_diff,
+    "ci_lower": ci_lower,
+    "ci_upper": ci_upper,
+}
+
+# ---------------------------------------------------------------------------
+# VISUALIZE OBSERVED BILL-PAYMENT RATES BY TREATMENT GROUP
+# ---------------------------------------------------------------------------
+# This bar chart shows only association.  The large gap motivates the causal
+# question, but the next sections must show whether the gap persists after
+# adjusting for confounders.
+# ---------------------------------------------------------------------------
+fig, ax = plt.subplots(figsize=(8, 5))
+labels = ["No emergency fund\n(T=0)", "Has emergency fund\n(T=1)"]
+rates = [rate_control, rate_treated]
+colors = ["#3498db", "#e74c3c"]
+
+bars = ax.bar(labels, rates, color=colors, edgecolor="black", alpha=0.85)
+ax.set_ylabel("Proportion paying all bills in full", fontsize=12)
+ax.set_ylim(0, 1)
+ax.set_title("Observed Bill-Payment Rate by Emergency-Fund Status\n(unadjusted association)", fontsize=13)
+
+for bar, rate in zip(bars, rates):
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+            f"{rate*100:.1f}%", ha="center", va="bottom", fontsize=12, fontweight="bold")
+
+ax.annotate("", xy=(1, rate_treated), xytext=(0, rate_control),
+            arrowprops=dict(arrowstyle="<->", color="#2c3e50", lw=2))
+ax.text(0.5, (rate_treated + rate_control)/2 + 0.05,
+        f"Difference:\n{unadjusted_diff*100:.1f} pp",
+        ha="center", va="bottom", fontsize=11, color="#2c3e50",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="#2c3e50"))
+
+ax.grid(axis="y", alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# ---------------------------------------------------------------------------
+# ESTIMATE PROPENSITY SCORES AND CHECK COMMON SUPPORT
+# ---------------------------------------------------------------------------
+# The propensity score is the predicted probability of treatment given the
+# measured confounders: e(X) = P(T=1 | X).  Under the positivity assumption,
+# every unit needs some chance of being treated or untreated.  If propensity
+# scores hit 0 or 1, the corresponding units have no credible counterfactual.
+# We therefore trim observations outside [b, 1-b], with b = 0.01 by default.
+# ---------------------------------------------------------------------------
+
+# Use the seven canonical adjustment variables as predictors.
+# Note: these are categorical codes, not continuous.  For this notebook we use
+# them directly in a logistic regression for simplicity; this implicitly treats
+# adjacent codes as evenly spaced.  The results align with the main pipeline.
+X_vars = ["PPINCIMP", "PPEDUC", "PPEMP", "PPAGE", "PPMARIT", "PPHOUSE", "PPNET"]
+X = df[X_vars].copy()
+T = df["T"].values
+Y = df["Y"].values
+
+# Fit a penalized logistic regression for treatment.
+# The small L2 penalty improves numerical stability without changing the story.
+ps_model = LogisticRegression(
+    penalty="l2",
+    C=1.0,
+    solver="lbfgs",
+    max_iter=1000,
+    random_state=SEED,
+)
+ps_model.fit(X, T)
+
+# Estimated propensity scores for every respondent
+df["propensity"] = ps_model.predict_proba(X)[:, 1]
+
+# Common-support trimming
+SUPPORT_BOUND = 0.01
+in_support = (df["propensity"] > SUPPORT_BOUND) & (df["propensity"] < (1 - SUPPORT_BOUND))
+df_support = df[in_support].copy()
+
+print(f"Total analytic sample:     {len(df):,}")
+print(f"Support-retained sample:   {len(df_support):,}")
+print(f"Excluded by support rule:  {(~in_support).sum():,}")
+print(f"Treated in support:        {df_support['T'].sum():,}")
+print(f"Control in support:        {(df_support['T'] == 0).sum():,}")
+print(f"\nPropensity score range: [{df['propensity'].min():.4f}, {df['propensity'].max():.4f}]")
+print(f"Support interval:         ({SUPPORT_BOUND}, {1-SUPPORT_BOUND})")
+
+ps_diag = {
+    "n_total": len(df),
+    "n_support": len(df_support),
+    "support_bound": SUPPORT_BOUND,
+}
+
+# ---------------------------------------------------------------------------
+# VISUALIZE PROPENSITY-SCORE OVERLAP
+# ---------------------------------------------------------------------------
+# Overlapping histograms let us see whether treated and control respondents
+# share the same range of estimated treatment probabilities.  Good overlap
+# means we can find comparable counterfactuals; poor overlap means part of the
+# sample cannot contribute to a well-identified ATE.
+# ---------------------------------------------------------------------------
+fig, ax = plt.subplots(figsize=(10, 6))
+
+ps_treated = df.loc[df["T"] == 1, "propensity"]
+ps_control = df.loc[df["T"] == 0, "propensity"]
+
+ax.hist(ps_control, bins=50, alpha=0.6, label="Control (T=0)", color="#3498db", density=True)
+ax.hist(ps_treated, bins=50, alpha=0.6, label="Treated (T=1)", color="#e74c3c", density=True)
+
+ax.axvline(SUPPORT_BOUND, color="black", linestyle="--", linewidth=1.5, label=f"Support bound = {SUPPORT_BOUND}")
+ax.axvline(1 - SUPPORT_BOUND, color="black", linestyle="--", linewidth=1.5)
+
+ax.set_xlabel("Estimated propensity score", fontsize=12)
+ax.set_ylabel("Density", fontsize=12)
+ax.set_title("Propensity Score Overlap Between Treatment Groups\n(common support check)", fontsize=13)
+ax.legend(fontsize=11)
+ax.grid(axis="y", alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+print("Interpretation: Good overlap means both groups exist across the propensity range. "
+      "Poor overlap would mean some respondents have no credible counterfactuals.")
+
+# ---------------------------------------------------------------------------
+# COVARIATE BALANCE DIAGNOSTICS
+# ---------------------------------------------------------------------------
+# Balance measures whether treated and control groups look similar on measured
+# confounders.  Before adjustment they usually do not (richer, older, more
+# educated people are more likely to have emergency funds).  After IPW
+# weighting, differences should shrink.
+#
+# We use the standardized mean difference (SMD):
+#   SMD = (mean_treated - mean_control) / pooled_sd
+# A common target is |SMD| < 0.10.
+# ---------------------------------------------------------------------------
+
+def compute_smd(data, var, weight_col=None):
+    """Compute standardized mean difference for a numeric variable."""
+    treated = data.loc[data["T"] == 1, var]
+    control = data.loc[data["T"] == 0, var]
+    
+    if weight_col is not None:
+        # Weighted mean and variance using the IPW weights
+        w_t = data.loc[data["T"] == 1, weight_col]
+        w_c = data.loc[data["T"] == 0, weight_col]
+        mean_t = np.average(treated, weights=w_t)
+        mean_c = np.average(control, weights=w_c)
+        var_t = np.average((treated - mean_t)**2, weights=w_t)
+        var_c = np.average((control - mean_c)**2, weights=w_c)
+    else:
+        mean_t, mean_c = treated.mean(), control.mean()
+        var_t, var_c = treated.var(ddof=1), control.var(ddof=1)
+    
+    pooled_sd = math.sqrt((var_t + var_c) / 2)
+    if pooled_sd == 0:
+        return 0.0
+    return (mean_t - mean_c) / pooled_sd
+
+# Build unstabilized IPW weights:
+#   treated units get weight 1 / e(X)
+#   control units get weight 1 / (1 - e(X))
+# These weights create a pseudo-population in which treatment is independent
+# of the measured confounders.
+df_support["ipw_weight"] = np.where(
+    df_support["T"] == 1,
+    1 / df_support["propensity"],
+    1 / (1 - df_support["propensity"]),
+)
+
+balance_records = []
+for var in X_vars:
+    smd_unweighted = compute_smd(df_support, var, weight_col=None)
+    smd_weighted = compute_smd(df_support, var, weight_col="ipw_weight")
+    balance_records.append({
+        "variable": var,
+        "smd_unweighted": smd_unweighted,
+        "smd_weighted": smd_weighted,
+    })
+
+balance_df = pd.DataFrame(balance_records)
+max_smd_before = balance_df["smd_unweighted"].abs().max()
+max_smd_after = balance_df["smd_weighted"].abs().max()
+all_balanced = max_smd_after < 0.10
+
+print("=== BALANCE SUMMARY ===")
+print(f"Maximum |SMD| before weighting: {max_smd_before:.3f}")
+print(f"Maximum |SMD| after weighting:  {max_smd_after:.3f}")
+print(f"All covariates balanced (<0.10): {all_balanced}")
+print("\nDetailed balance table:")
+display(balance_df.round(3))
+
+# ---------------------------------------------------------------------------
+# VISUALIZE COVARIATE BALANCE BEFORE AND AFTER IPW
+# ---------------------------------------------------------------------------
+# This plot shows the balance improvement in one glance.  Bars that fall
+# below the 0.10 line after weighting indicate that the weighted sample is
+# close to randomized on the measured confounders.
+# ---------------------------------------------------------------------------
+fig, ax = plt.subplots(figsize=(10, 6))
+
+y_pos = np.arange(len(balance_df))
+ax.barh(y_pos - 0.2, balance_df["smd_unweighted"].abs(), height=0.35,
+        label="Before adjustment", color="#3498db", alpha=0.85)
+ax.barh(y_pos + 0.2, balance_df["smd_weighted"].abs(), height=0.35,
+        label="After IPW adjustment", color="#2ecc71", alpha=0.85)
+
+ax.axvline(0.10, color="red", linestyle="--", linewidth=1.5, label="Balance threshold = 0.10")
+ax.set_yticks(y_pos)
+ax.set_yticklabels(balance_df["variable"])
+ax.set_xlabel("Absolute Standardized Mean Difference (|SMD|)", fontsize=12)
+ax.set_title("Covariate Balance Before and After IPW Weighting", fontsize=13)
+ax.legend(fontsize=11)
+ax.grid(axis="x", alpha=0.3)
+ax.invert_yaxis()
+plt.tight_layout()
+plt.show()
+
+print("Good balance means the weighted treated and control groups are comparable on measured confounders.")
+
+# ---------------------------------------------------------------------------
+# IPW ESTIMATOR FOR THE ATE
+# ---------------------------------------------------------------------------
+# Inverse Probability Weighting creates a pseudo-population in which each
+# respondent's observed outcome is weighted up to represent the counterfactual
+# group they did not experience.
+#   Treated weight:    1 / e(X)
+#   Control weight:    1 / (1 - e(X))
+# The weighted means estimate E[Y(1)] and E[Y(0)], and their difference is the
+# ATE.  This is the pre-specified alternative estimator in the project.
+# ---------------------------------------------------------------------------
+
+def estimate_ate_ipw(data, ps_col="propensity", treatment_col="T", outcome_col="Y"):
+    """Horvitz-Thompson style IPW ATE estimator."""
+    ps = data[ps_col].values
+    T = data[treatment_col].values
+    Y = data[outcome_col].values
+    
+    w = np.where(T == 1, 1 / ps, 1 / (1 - ps))
+    
+    mu1 = np.sum(w * T * Y) / np.sum(w * T)
+    mu0 = np.sum(w * (1 - T) * Y) / np.sum(w * (1 - T))
+    ate = mu1 - mu0
+    return ate, mu1, mu0
+
+ipw_ate, ipw_mu1, ipw_mu0 = estimate_ate_ipw(df_support)
+
+print("=== IPW ESTIMATE ===")
+print(f"E[Y(1)] (counterfactual treated mean):  {ipw_mu1*100:.2f}%")
+print(f"E[Y(0)] (counterfactual control mean):  {ipw_mu0*100:.2f}%")
+print(f"ATE (percentage points):                {ipw_ate*100:.2f} pp")
+
+# ---------------------------------------------------------------------------
+# AIPW (DOUBLY ROBUST) ESTIMATOR FOR THE ATE
+# ---------------------------------------------------------------------------
+# Augmented IPW combines IPW with an outcome regression.  It is called
+# "doubly robust" because it remains consistent if EITHER the propensity model
+# OR the outcome model is correctly specified (not necessarily both).  This is
+# the primary estimator used in the project.
+#
+# The estimator uses an influence function:
+#   IF_1 = (T/e(X)) * (Y - mu(1,X)) + mu(1,X)
+#   IF_0 = ((1-T)/(1-e(X))) * (Y - mu(0,X)) + mu(0,X)
+#   ATE  = mean(IF_1) - mean(IF_0)
+# The standard error is derived from the empirical variance of the influence.
+# ---------------------------------------------------------------------------
+
+def estimate_ate_aipw(data, X_vars, treatment_col="T", outcome_col="Y", ps_col="propensity", seed=SEED):
+    """
+    Augmented IPW estimator using logistic propensity and logistic outcome models.
+    Returns ATE, potential-outcome means, and influence-function standard error.
+    """
+    X = data[X_vars].values
+    T = data[treatment_col].values
+    Y = data[outcome_col].values
+    ps = data[ps_col].values
+    n = len(data)
+    
+    # Outcome model: E[Y | T, X]
+    X_out = np.column_stack([T, X])
+    out_model = LogisticRegression(
+        penalty="l2", C=1.0, solver="lbfgs", max_iter=1000, random_state=seed
+    )
+    out_model.fit(X_out, Y)
+    
+    # Predict potential outcomes under T=1 and T=0 for everyone
+    X1 = np.column_stack([np.ones(n), X])
+    X0 = np.column_stack([np.zeros(n), X])
+    mu1_x = out_model.predict_proba(X1)[:, 1]
+    mu0_x = out_model.predict_proba(X0)[:, 1]
+    
+    # AIPW influence-function components
+    if1 = (T / ps) * (Y - mu1_x) + mu1_x
+    if0 = ((1 - T) / (1 - ps)) * (Y - mu0_x) + mu0_x
+    
+    ate = if1.mean() - if0.mean()
+    
+    # Influence-function based standard error
+    influence = (if1 - if0) - ate
+    se = math.sqrt((influence ** 2).sum() / (n ** 2))
+    
+    return ate, if1.mean(), if0.mean(), se
+
+aipw_ate, aipw_mu1, aipw_mu0, aipw_se = estimate_ate_aipw(df_support, X_vars)
+aipw_ci_lower = aipw_ate - 1.96 * aipw_se
+aipw_ci_upper = aipw_ate + 1.96 * aipw_se
+
+print("=== AIPW ESTIMATE (PRIMARY) ===")
+print(f"E[Y(1)] (counterfactual treated mean):  {aipw_mu1*100:.2f}%")
+print(f"E[Y(0)] (counterfactual control mean):  {aipw_mu0*100:.2f}%")
+print(f"ATE (percentage points):                {aipw_ate*100:.2f} pp")
+print(f"95% confidence interval:                [{aipw_ci_lower*100:.2f}%, {aipw_ci_upper*100:.2f}%]")
+
+estimates = {
+    "unadjusted": unadjusted,
+    "ipw": {"estimate": ipw_ate, "mu1": ipw_mu1, "mu0": ipw_mu0},
+    "aipw": {"estimate": aipw_ate, "mu1": aipw_mu1, "mu0": aipw_mu0,
+             "ci_lower": aipw_ci_lower, "ci_upper": aipw_ci_upper, "se": aipw_se},
+}
+
+# ---------------------------------------------------------------------------
+# COMPARE UNADJUSTED, IPW, AND AIPW ESTIMATES
+# ---------------------------------------------------------------------------
+# This chart shows how the raw association shrinks once we adjust for
+# confounders.  The gap between unadjusted and adjusted estimates is the
+# portion that can be explained by measured differences between treated and
+# control respondents.
+# ---------------------------------------------------------------------------
+fig, ax = plt.subplots(figsize=(10, 6))
+
+methods = ["Unadjusted\nassociation", "IPW\nadjusted", "AIPW\n(primary)"]
+estimates_pp = [
+    unadjusted["estimate"] * 100,
+    ipw_ate * 100,
+    aipw_ate * 100,
+]
+errors = [
+    (unadjusted["estimate"] - unadjusted["ci_lower"]) * 100,
+    None,  # no CI computed for IPW in this notebook
+    (aipw_ate - aipw_ci_lower) * 100,
+]
+colors = ["#3498db", "#9b59b6", "#e74c3c"]
+
+bars = ax.bar(methods, estimates_pp, color=colors, alpha=0.85, edgecolor="black")
+
+# Add error bars where available
+for i, (bar, err) in enumerate(zip(bars, errors)):
+    if err is not None:
+        ax.errorbar(bar.get_x() + bar.get_width()/2, estimates_pp[i],
+                    yerr=err, fmt="none", color="black", capsize=5, capthick=2)
+
+ax.axhline(0, color="black", linewidth=0.8)
+ax.set_ylabel("Effect (percentage points)", fontsize=12)
+ax.set_title("Unadjusted vs Adjusted Effect Estimates\n(Emergency fund → Bills paid in full)", fontsize=13)
+
+for bar, est in zip(bars, estimates_pp):
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+            f"{est:.1f} pp", ha="center", va="bottom", fontsize=12, fontweight="bold")
+
+ax.grid(axis="y", alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+print("Interpretation: The adjusted estimates are smaller than the raw association, "
+      "suggesting that observed confounders explain part of the gap.")
+
+# ---------------------------------------------------------------------------
+# VISUALIZE THE COUNTERFACTUAL CONTRAST
+# ---------------------------------------------------------------------------
+# This bar chart translates the ATE into the two potential-outcome means.
+# E[Y(1)] is the estimated bill-payment rate if everyone had an emergency fund;
+# E[Y(0)] is the estimated rate if no one had one.  The gap between them is
+# the estimated average causal effect.
+# ---------------------------------------------------------------------------
+fig, ax = plt.subplots(figsize=(9, 6))
+
+labels = ["No emergency fund\ndo(T=0)", "Has emergency fund\ndo(T=1)"]
+means = [aipw_mu0, aipw_mu1]
+colors = ["#3498db", "#e74c3c"]
+
+bars = ax.bar(labels, means, color=colors, edgecolor="black", alpha=0.85)
+ax.set_ylabel("Estimated probability of paying all bills in full", fontsize=12)
+ax.set_ylim(0, 1)
+ax.set_title("Counterfactual Outcome Means Under do(T=0) and do(T=1)\n(AIPW estimate)", fontsize=13)
+
+for bar, mean in zip(bars, means):
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+            f"{mean*100:.1f}%", ha="center", va="bottom", fontsize=12, fontweight="bold")
+
+ax.annotate("", xy=(1, aipw_mu1), xytext=(0, aipw_mu0),
+            arrowprops=dict(arrowstyle="<->", color="#2c3e50", lw=2))
+ax.text(0.5, (aipw_mu1 + aipw_mu0)/2 + 0.05,
+        f"Estimated ATE:\n{aipw_ate*100:.1f} pp",
+        ha="center", va="bottom", fontsize=11, color="#2c3e50",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="#2c3e50"))
+
+ax.grid(axis="y", alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+print(f"AIPW ATE = {aipw_ate*100:.2f} percentage points (95% CI: {aipw_ci_lower*100:.2f}% to {aipw_ci_upper*100:.2f}%)")
+
+# ---------------------------------------------------------------------------
+# ROBUSTNESS AND SENSITIVITY ANALYSIS
+# ---------------------------------------------------------------------------
+# Any causal estimate should be checked for stability.  We examine:
+#   1. Weight truncation: do a few extreme IPW weights drive the result?
+#   2. E-value: how strong would an unmeasured confounder have to be to fully
+#      explain away the observed effect?
+# These checks quantify robustness; they do not prove causality.
+# ---------------------------------------------------------------------------
+
+# --- 1. Weight-stability sensitivity ---
+# Cap weights at the 99th percentile.  If the ATE changes dramatically, the
+# original estimate was dominated by a few high-weight observations.
+WEIGHT_CAP_QUANTILE = 0.99
+weight_cap = df_support["ipw_weight"].quantile(WEIGHT_CAP_QUANTILE)
+df_support["ipw_weight_capped"] = df_support["ipw_weight"].clip(upper=weight_cap)
+
+def estimate_ate_ipw_weighted(data, weight_col, treatment_col="T", outcome_col="Y"):
+    T = data[treatment_col].values
+    Y = data[outcome_col].values
+    w = data[weight_col].values
+    mu1 = np.sum(w * T * Y) / np.sum(w * T)
+    mu0 = np.sum(w * (1 - T) * Y) / np.sum(w * (1 - T))
+    return mu1 - mu0, mu1, mu0
+
+ipw_uncapped_ate, _, _ = estimate_ate_ipw_weighted(df_support, "ipw_weight")
+ipw_capped_ate, _, _ = estimate_ate_ipw_weighted(df_support, "ipw_weight_capped")
+
+print("=== WEIGHT-STABILITY SENSITIVITY ===")
+print(f"Weight cap quantile:              {WEIGHT_CAP_QUANTILE}")
+print(f"Weight cap value:                 {weight_cap:.2f}")
+print(f"Max uncapped weight:              {df_support['ipw_weight'].max():.2f}")
+print(f"IPW ATE (uncapped):               {ipw_uncapped_ate*100:.2f} pp")
+print(f"IPW ATE (capped at {WEIGHT_CAP_QUANTILE} quantile):  {ipw_capped_ate*100:.2f} pp")
+print(f"Difference:                       {(ipw_capped_ate - ipw_uncapped_ate)*100:.2f} pp")
+
+# --- 2. E-value sensitivity ---
+# The E-value (VanderWeele & Ding, 2017) asks: what risk-ratio association
+# would an unmeasured confounder need with both treatment and outcome to
+# explain away the observed effect?  Values closer to 1 mean weaker confounding
+# could overturn the result.
+rr_obs = aipw_mu1 / max(aipw_mu0, 1e-10)
+e_value_point = rr_obs + math.sqrt(rr_obs * (rr_obs - 1))
+
+# Lower-CI E-value uses the least favorable point inside the confidence
+# interval for the risk ratio.
+mu1_lower = aipw_mu1 - 1.96 * aipw_se
+mu0_upper = aipw_mu0 + 1.96 * aipw_se
+rr_ci = max(mu1_lower, 1e-10) / max(mu0_upper, 1e-10)
+e_value_ci = rr_ci + math.sqrt(rr_ci * (rr_ci - 1)) if rr_ci > 1 else 1.0
+
+print("\n=== E-VALUE SENSITIVITY ===")
+print(f"Risk ratio (point):               {rr_obs:.3f}")
+print(f"E-value (point estimate):         {e_value_point:.3f}")
+print(f"E-value (lower CI):               {e_value_ci:.3f}")
+print("\nInterpretation: An unmeasured confounder would need to be associated with both")
+print("treatment and outcome by a risk-ratio of at least the E-value to fully explain")
+print("away the observed effect, conditional on the measured covariates.")
+
+# ---------------------------------------------------------------------------
+# SUMMARY OF FINDINGS
+# ---------------------------------------------------------------------------
+# We collect the main numerical results into one table.  This makes it easy
+# for an assessor to verify the sample, the diagnostics, and the effect
+# estimates at a glance.  We also save a machine-readable JSON summary for
+# provenance and reproducibility.
+# ---------------------------------------------------------------------------
+summary_records = [
+    {"Item": "Raw SHED 2023 records", "Value": f"{sample_meta['raw_n']:,}"},
+    {"Item": "Analytic sample", "Value": f"{sample_meta['analytic_n']:,}"},
+    {"Item": "Support-retained sample", "Value": f"{ps_diag['n_support']:,}"},
+    {"Item": "Treated (has emergency fund)", "Value": f"{sample_meta['treated_n']:,}"},
+    {"Item": "Control (no emergency fund)", "Value": f"{sample_meta['control_n']:,}"},
+    {"Item": "Unadjusted association", "Value": f"{unadjusted['estimate']*100:.2f} pp (95% CI: {unadjusted['ci_lower']*100:.2f}%, {unadjusted['ci_upper']*100:.2f}%)"},
+    {"Item": "IPW adjusted ATE", "Value": f"{ipw_ate*100:.2f} pp"},
+    {"Item": "AIPW primary ATE", "Value": f"{aipw_ate*100:.2f} pp (95% CI: {aipw_ci_lower*100:.2f}%, {aipw_ci_upper*100:.2f}%)"},
+    {"Item": "Counterfactual E[Y(1)]", "Value": f"{aipw_mu1*100:.2f}%"},
+    {"Item": "Counterfactual E[Y(0)]", "Value": f"{aipw_mu0*100:.2f}%"},
+    {"Item": "Max |SMD| before weighting", "Value": f"{max_smd_before:.3f}"},
+    {"Item": "Max |SMD| after weighting", "Value": f"{max_smd_after:.3f}"},
+    {"Item": "All covariates balanced (<0.10)", "Value": str(all_balanced)},
+    {"Item": "E-value (point estimate)", "Value": f"{e_value_point:.3f}"},
+    {"Item": "E-value (lower CI)", "Value": f"{e_value_ci:.3f}"},
+]
+
+summary_df = pd.DataFrame(summary_records)
+display(summary_df)
+
+# Save a JSON summary in the notebook folder for traceability
+summary_out = {
+    "project": "Emergency Fund and Household Bill Payment Causal AI Capstone",
+    "data_status": "empirical",
+    "survey_wave": "SHED 2023",
+    "design": "Cross-sectional",
+    **sample_meta,
+    "propensity_support": ps_diag,
+    "balance": {"max_smd_before": max_smd_before, "max_smd_after": max_smd_after, "all_balanced": all_balanced},
+    "estimates": {
+        "unadjusted": {k: float(v) for k, v in unadjusted.items()},
+        "ipw": {k: float(v) for k, v in estimates["ipw"].items()},
+        "aipw": {k: float(v) for k, v in estimates["aipw"].items()},
+    },
+    "sensitivity": {
+        "e_value_point": e_value_point,
+        "e_value_lower_ci": e_value_ci,
+        "ipw_uncapped_ate_pp": ipw_uncapped_ate * 100,
+        "ipw_capped_ate_pp": ipw_capped_ate * 100,
+    },
+}
+
+summary_path = NOTEBOOK_DIR / "NOTEBOOK" / "notebook_summary.json"
+summary_path.parent.mkdir(parents=True, exist_ok=True)
+with open(summary_path, "w") as f:
+    json.dump(summary_out, f, indent=2, default=str)
+
+print(f"\nSummary saved to: {summary_path}")
+
+# ---------------------------------------------------------------------------
+# PRE-SPECIFIED EXPLORATORY SUBGROUP ANALYSIS
+# ---------------------------------------------------------------------------
+# Subgroup effects are estimated only to describe possible heterogeneity.
+# They are NOT used to select the primary conclusion.  We limit ourselves to
+# two substantively motivated subgroups defined before seeing results:
+# income tier and age band.
+# ---------------------------------------------------------------------------
+
+# Income tier: use the numeric PPINCIMP directly (1 = lowest, 7 = highest).
+df_support["income_tier"] = df_support["PPINCIMP"].astype(int)
+
+# Age band: cut the continuous age variable into three policy-relevant groups.
+def age_band(age):
+    if age < 35:
+        return "18-34"
+    elif age < 55:
+        return "35-54"
+    else:
+        return "55+"
+
+df_support["age_band"] = df_support["PPAGE"].apply(age_band)
+
+def estimate_subgroup_ates(data, subgroup_col):
+    """Estimate AIPW ATE within each level of subgroup_col."""
+    results = []
+    for level, sub in data.groupby(subgroup_col):
+        # Skip very small subgroups or subgroups with only one treatment level
+        if len(sub) < 50 or sub["T"].nunique() < 2:
+            continue
+        try:
+            ate, mu1, mu0, se = estimate_ate_aipw(sub, X_vars, seed=SEED)
+            results.append({
+                "subgroup": str(level),
+                "n": len(sub),
+                "treated": int(sub["T"].sum()),
+                "control": int((sub["T"] == 0).sum()),
+                "ate_pp": ate * 100,
+                "ci_lower_pp": (ate - 1.96 * se) * 100,
+                "ci_upper_pp": (ate + 1.96 * se) * 100,
+            })
+        except Exception as exc:
+            print(f"Subgroup {level} failed: {exc}")
+    return pd.DataFrame(results)
+
+income_results = estimate_subgroup_ates(df_support, "income_tier").sort_values("subgroup")
+age_results = estimate_subgroup_ates(df_support, "age_band").sort_values("subgroup")
+
+print("=== SUBGROUP ATEs BY INCOME TIER ===")
+display(income_results.round(2))
+
+print("\n=== SUBGROUP ATEs BY AGE BAND ===")
+display(age_results.round(2))
+
+# ---------------------------------------------------------------------------
+# VISUALIZE SUBGROUP EFFECTS WITH UNCERTAINTY
+# ---------------------------------------------------------------------------
+# Forest-style plots make it easy to compare subgroup ATEs against the overall
+# ATE (red dashed line).  Points to the right of zero indicate a positive
+# estimated effect; horizontal lines are 95% confidence intervals.
+# ---------------------------------------------------------------------------
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Income tier
+ax = axes[0]
+y_pos = np.arange(len(income_results))
+ax.errorbar(income_results["ate_pp"], y_pos,
+            xerr=[income_results["ate_pp"] - income_results["ci_lower_pp"],
+                  income_results["ci_upper_pp"] - income_results["ate_pp"]],
+            fmt="o", color="#9b59b6", ecolor="black", capsize=4, markersize=8)
+ax.axvline(aipw_ate * 100, color="red", linestyle="--", label="Overall ATE")
+ax.set_yticks(y_pos)
+ax.set_yticklabels([f"Tier {s}" for s in income_results["subgroup"]])
+ax.set_xlabel("ATE (percentage points)", fontsize=11)
+ax.set_title("ATE by Income Tier\n(pre-specified exploratory)", fontsize=12)
+ax.grid(axis="x", alpha=0.3)
+ax.legend()
+
+# Age band
+ax = axes[1]
+y_pos = np.arange(len(age_results))
+ax.errorbar(age_results["ate_pp"], y_pos,
+            xerr=[age_results["ate_pp"] - age_results["ci_lower_pp"],
+                  age_results["ci_upper_pp"] - age_results["ate_pp"]],
+            fmt="o", color="#2ecc71", ecolor="black", capsize=4, markersize=8)
+ax.axvline(aipw_ate * 100, color="red", linestyle="--", label="Overall ATE")
+ax.set_yticks(y_pos)
+ax.set_yticklabels(age_results["subgroup"])
+ax.set_xlabel("ATE (percentage points)", fontsize=11)
+ax.set_title("ATE by Age Band\n(pre-specified exploratory)", fontsize=12)
+ax.grid(axis="x", alpha=0.3)
+ax.legend()
+
+plt.suptitle("Exploratory Subgroup Effects with 95% Confidence Intervals", fontsize=14, y=1.02)
+plt.tight_layout()
+plt.show()
+
+print("Warning: Subgroup findings are exploratory. Do not select or report based on preferred effect sizes.")

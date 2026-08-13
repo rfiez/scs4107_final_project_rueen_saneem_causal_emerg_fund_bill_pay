@@ -11,6 +11,8 @@ This repository contains the deliverable Jupyter notebook for the University of 
 | `module_labels_validation.txt` | Validation notes for module and cell labels |
 | `notebook_summary.json` | Machine-readable summary metadata of the notebook structure |
 | `reorder_validation.txt` | Validation log from notebook cell reordering |
+| `causal_ai_capstone_presentation_module_guided_revised.pptx` | Module-guided PowerPoint deck with the same figures used in the notebook |
+| `causal_ai_capstone_presentation_student_friendly_no_notes_delivery_v1_5.pptx` | Student-friendly delivery version with speaker notes removed |
 | `data/raw/shed_2023.csv` | SHED 2023 public use data file used by the notebook |
 
 ## How to view or run the notebook
